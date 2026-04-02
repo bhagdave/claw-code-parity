@@ -115,12 +115,6 @@ impl AnthropicRequestProfile {
         for (key, value) in &self.extra_body {
             object.insert(key.clone(), value.clone());
         }
-        if !self.betas.is_empty() {
-            object.insert(
-                "betas".to_string(),
-                Value::Array(self.betas.iter().cloned().map(Value::String).collect()),
-            );
-        }
         Ok(body)
     }
 }
@@ -462,14 +456,7 @@ mod tests {
             body["metadata"]["source"],
             Value::String("test".to_string())
         );
-        assert_eq!(
-            body["betas"],
-            serde_json::json!([
-                "claude-code-20250219",
-                "prompt-caching-scope-2026-01-05",
-                "tools-2026-04-01"
-            ])
-        );
+        assert!(body.get("betas").is_none(), "betas must not appear in the request body");
     }
 
     #[test]

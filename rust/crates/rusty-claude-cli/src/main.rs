@@ -30,9 +30,9 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-    validate_slash_command_input, SlashCommand,
+    handle_agents_slash_command, handle_mcp_slash_command, handle_plugins_slash_command,
+    handle_skills_slash_command, render_slash_command_help, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -44,7 +44,8 @@ use runtime::{
     ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -107,6 +108,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
+        CliAction::Mcp { args } => LiveCli::print_mcp(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
@@ -145,6 +147,9 @@ enum CliAction {
     DumpManifests,
     BootstrapPlan,
     Agents {
+        args: Option<String>,
+    },
+    Mcp {
         args: Option<String>,
     },
     Skills {
@@ -342,6 +347,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
         }),
+        "mcp" => Ok(CliAction::Mcp {
+            args: join_optional_args(&rest[1..]),
+        }),
         "skills" => Ok(CliAction::Skills {
             args: join_optional_args(&rest[1..]),
         }),
@@ -400,6 +408,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         "dump-manifests"
             | "bootstrap-plan"
             | "agents"
+            | "mcp"
             | "skills"
             | "system-prompt"
             | "login"
@@ -435,6 +444,14 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help),
         Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents { args }),
+        Ok(Some(SlashCommand::Mcp { action, target })) => Ok(CliAction::Mcp {
+            args: match (action, target) {
+                (None, None) => None,
+                (Some(action), None) => Some(action),
+                (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                (None, Some(target)) => Some(target),
+            },
+        }),
         Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills { args }),
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
@@ -602,12 +619,32 @@ fn permission_mode_from_label(mode: &str) -> PermissionMode {
     }
 }
 
+fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
+    match mode {
+        ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
+        ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
+        ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
+    }
+}
+
 fn default_permission_mode() -> PermissionMode {
     env::var("RUSTY_CLAUDE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
-        .map_or(PermissionMode::DangerFullAccess, permission_mode_from_label)
+        .map(permission_mode_from_label)
+        .or_else(config_permission_mode_for_current_dir)
+        .unwrap_or(PermissionMode::DangerFullAccess)
+}
+
+fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load()
+        .ok()?
+        .permission_mode()
+        .map(permission_mode_from_resolved)
 }
 
 fn filter_tool_specs(
@@ -1301,12 +1338,17 @@ fn run_resume_command(
                     ),
                 });
             }
+            let backup_path = write_session_clear_backup(session, session_path)?;
+            let previous_session_id = session.session_id.clone();
             let cleared = Session::new();
+            let new_session_id = cleared.session_id.clone();
             cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Cleared resumed session file {}.",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    backup_path.display(),
+                    backup_path.display(),
                     session_path.display()
                 )),
             })
@@ -1353,6 +1395,19 @@ fn run_resume_command(
             session: session.clone(),
             message: Some(render_config_report(section.as_deref())?),
         }),
+        SlashCommand::Mcp { action, target } => {
+            let cwd = env::current_dir()?;
+            let args = match (action.as_deref(), target.as_deref()) {
+                (None, None) => None,
+                (Some(action), None) => Some(action.to_string()),
+                (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                (None, Some(target)) => Some(target.to_string()),
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
+            })
+        }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
@@ -1809,6 +1864,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_repl_command(
         &mut self,
         command: SlashCommand,
@@ -1868,6 +1924,16 @@ impl LiveCli {
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
             SlashCommand::Config { section } => {
                 Self::print_config(section.as_deref())?;
+                false
+            }
+            SlashCommand::Mcp { action, target } => {
+                let args = match (action.as_deref(), target.as_deref()) {
+                    (None, None) => None,
+                    (Some(action), None) => Some(action.to_string()),
+                    (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                    (None, Some(target)) => Some(target.to_string()),
+                };
+                Self::print_mcp(args.as_deref())?;
                 false
             }
             SlashCommand::Memory => {
@@ -2051,6 +2117,7 @@ impl LiveCli {
             return Ok(false);
         }
 
+        let previous_session = self.session.clone();
         let session_state = Session::new();
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -2066,10 +2133,13 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         println!(
-            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
+            "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
+            previous_session.id,
+            previous_session.id,
             self.model,
             self.permission_mode.as_str(),
             self.session.id,
+            self.session.path.display(),
         );
         Ok(true)
     }
@@ -2132,6 +2202,12 @@ impl LiveCli {
     fn print_agents(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         println!("{}", handle_agents_slash_command(args, &cwd)?);
+        Ok(())
+    }
+
+    fn print_mcp(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        println!("{}", handle_mcp_slash_command(args, &cwd)?);
         Ok(())
     }
 
@@ -2597,6 +2673,27 @@ fn format_session_modified_age(modified_epoch_millis: u128) -> String {
         3_600..=86_399 => format!("{}h-ago", delta_seconds / 3_600),
         _ => format!("{}d-ago", delta_seconds / 86_400),
     }
+}
+
+fn write_session_clear_backup(
+    session: &Session,
+    session_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let backup_path = session_clear_backup_path(session_path);
+    session.save_to_path(&backup_path)?;
+    Ok(backup_path)
+}
+
+fn session_clear_backup_path(session_path: &Path) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_millis());
+    let file_name = session_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
 }
 
 fn render_repl_help() -> String {
@@ -3367,7 +3464,7 @@ fn build_runtime_plugin_state_with_loader(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
@@ -4192,6 +4289,9 @@ fn slash_command_completion_candidates_with_sessions(
         "/config hooks",
         "/config model",
         "/config plugins",
+        "/mcp ",
+        "/mcp list",
+        "/mcp show ",
         "/export ",
         "/issue ",
         "/model ",
@@ -4217,6 +4317,7 @@ fn slash_command_completion_candidates_with_sessions(
         "/teleport ",
         "/ultraplan ",
         "/agents help",
+        "/mcp help",
         "/skills help",
     ] {
         completions.insert(candidate.to_string());
@@ -4907,6 +5008,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw login")?;
@@ -4978,6 +5080,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
     writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
@@ -5140,6 +5243,74 @@ mod tests {
     }
 
     #[test]
+    fn default_permission_mode_uses_project_config_when_env_is_unset() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"permissionMode":"acceptEdits"}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        let resolved = with_current_dir(&cwd, super::default_permission_mode);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn env_permission_mode_overrides_project_config_default() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"permissionMode":"acceptEdits"}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+
+        let resolved = with_current_dir(&cwd, super::default_permission_mode);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, PermissionMode::ReadOnly);
+    }
+
+    #[test]
     fn parses_prompt_subcommand() {
         let args = vec![
             "prompt".to_string(),
@@ -5298,6 +5469,10 @@ mod tests {
             CliAction::Agents { args: None }
         );
         assert_eq!(
+            parse_args(&["mcp".to_string()]).expect("mcp should parse"),
+            CliAction::Mcp { args: None }
+        );
+        assert_eq!(
             parse_args(&["skills".to_string()]).expect("skills should parse"),
             CliAction::Skills { args: None }
         );
@@ -5356,10 +5531,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_agents_and_skills_slash_commands() {
+    fn parses_direct_agents_mcp_and_skills_slash_commands() {
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents { args: None }
+        );
+        assert_eq!(
+            parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
+                .expect("/mcp show demo should parse"),
+            CliAction::Mcp {
+                args: Some("show demo".to_string())
+            }
         );
         assert_eq!(
             parse_args(&["/skills".to_string()]).expect("/skills should parse"),
@@ -5578,6 +5760,7 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
+        assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -5608,6 +5791,7 @@ mod tests {
         assert!(completions.contains(&"/session list".to_string()));
         assert!(completions.contains(&"/session switch session-current".to_string()));
         assert!(completions.contains(&"/resume session-old".to_string()));
+        assert!(completions.contains(&"/mcp list".to_string()));
         assert!(completions.contains(&"/ultraplan ".to_string()));
     }
 
@@ -5644,7 +5828,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "sandbox", "compact", "clear", "cost", "config", "memory",
+                "help", "status", "sandbox", "compact", "clear", "cost", "config", "mcp", "memory",
                 "init", "diff", "version", "export", "agents", "skills",
             ]
         );
@@ -5717,6 +5901,7 @@ mod tests {
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
         assert!(help.contains("claw agents"));
+        assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
     }
@@ -6620,6 +6805,9 @@ UU conflicted.rs",
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         let config_home = temp_dir();
+        // Inject a dummy API key so runtime construction succeeds without real credentials.
+        // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
         let workspace = temp_dir();
         let source_root = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -6668,6 +6856,7 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 }
 
